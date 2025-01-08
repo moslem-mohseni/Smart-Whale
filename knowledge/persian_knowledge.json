@@ -1,0 +1,20 @@
+{
+  "concepts": {},
+  "patterns": {
+    "[فعل] می‌کنند": {
+      "pattern": "[فعل] می‌کنند",
+      "examples": [
+        "برگ‌های پاییزی در باد می‌رقصند و داستان فصل را روایت می‌کنند."
+      ],
+      "frequency": 1,
+      "confidence": 0.9,
+      "last_seen": "2025-01-08T08:19:58.166740"
+    }
+  },
+  "stats": {
+    "total_concepts": 0,
+    "total_patterns": 1,
+    "total_updates": 1,
+    "last_update": "2025-01-08T08:19:58.166740"
+  }
+}
