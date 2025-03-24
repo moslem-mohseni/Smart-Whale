@@ -1,26 +1,64 @@
-# infrastructure/timescaledb/__init__.py
-"""
-TimescaleDB Service
------------------
-Time-series database for storing and analyzing financial and system data.
-Includes database migrations and management scripts.
-"""
+# مقداردهی اولیه ماژول TimescaleDB
 
-from .service.database_service import TimescaleDBService
-from .adapters.repository import Repository
-from .adapters.timeseries_repository import TimeSeriesRepository
-from .domain.models import TimeSeriesData, TableSchema
-from .domain.value_objects import TimeRange
-from .config.settings import TimescaleDBConfig
-from .storage.timescaledb_storage import TimescaleDBStorage
+# 🔹 تنظیمات و مدیریت اتصال
+from .config import TimescaleDBConfig, ConnectionPool, ReadWriteSplitter
+
+# 🔹 مدل‌های داده‌ای
+from .domain import TimeSeriesData, TableSchema, TimeRange
+
+# 🔹 مدیریت ذخیره‌سازی و اجرای کوئری‌ها
+from .storage import TimescaleDBStorage
+
+# 🔹 سرویس‌های بهینه‌سازی
+from .optimization import CacheManager, QueryOptimizer, DataCompressor
+
+# 🔹 مدیریت مقیاس‌پذیری
+from .scaling import ReplicationManager, PartitionManager
+
+# 🔹 ابزارهای امنیتی
+from .security import AccessControl, AuditLog, EncryptionManager
+
+# 🔹 سیستم مانیتورینگ
+from .monitoring import MetricsCollector, SlowQueryAnalyzer, HealthCheck
+
+# 🔹 سرویس‌های سطح بالا
+from .service import DatabaseService, ContinuousAggregation, DataRetention
+
+# 🔹 اسکریپت‌های مدیریتی
+from .scripts import cleanup_old_data, create_backup, restore_backup, analyze_performance
+
+# تعریف TimescaleDBService به عنوان alias برای DatabaseService
+# برای حفظ سازگاری با واردسازی‌های فعلی در infrastructure/__init__.py
+TimescaleDBService = DatabaseService
 
 __all__ = [
-    'TimescaleDBService',
-    'Repository',
-    'TimeSeriesRepository',
-    'TimeSeriesData',
-    'TableSchema',
-    'TimescaleDBConfig',
-    'TimeRange',
-    'TimescaleDBStorage'
+    # تنظیمات
+    "TimescaleDBConfig", "ConnectionPool", "ReadWriteSplitter",
+
+    # مدل‌های داده‌ای
+    "TimeSeriesData", "TableSchema", "TimeRange",
+
+    # ذخیره‌سازی
+    "TimescaleDBStorage",
+
+    # بهینه‌سازی
+    "CacheManager", "QueryOptimizer", "DataCompressor",
+
+    # مقیاس‌پذیری
+    "ReplicationManager", "PartitionManager",
+
+    # امنیت
+    "AccessControl", "AuditLog", "EncryptionManager",
+
+    # مانیتورینگ
+    "MetricsCollector", "SlowQueryAnalyzer", "HealthCheck",
+
+    # سرویس‌های اصلی
+    "DatabaseService", "ContinuousAggregation", "DataRetention",
+
+    # alias برای سازگاری با infrastructure/__init__.py
+    "TimescaleDBService",
+
+    # اسکریپت‌های مدیریتی
+    "cleanup_old_data", "create_backup", "restore_backup", "analyze_performance"
 ]

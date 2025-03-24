@@ -1,75 +1,78 @@
-# infrastructure/kafka/adapters/consumer.py
-from typing import Callable, Awaitable, Any
-from ..domain.models import Message
-from ..config.settings import KafkaConfig
-from confluent_kafka import Consumer as KafkaConsumer
+import asyncio
 import json
 import logging
-from datetime import datetime
+from typing import Callable, Awaitable
+from ..config.settings import KafkaConfig
+from ..domain.models import Message
+from ..adapters.connection_pool import KafkaConnectionPool
+from ..adapters.retry_mechanism import RetryMechanism
+from ..adapters.circuit_breaker import CircuitBreaker
+from ..adapters.backpressure import BackpressureHandler
+from confluent_kafka import Consumer as KafkaConsumer
 
 logger = logging.getLogger(__name__)
 
 
 class MessageConsumer:
     """
-    کلاس مصرف‌کننده پیام
-
-    این کلاس مسئولیت دریافت و پردازش پیام‌های کافکا را بر عهده دارد.
+    مصرف‌کننده پیام Kafka با مکانیزم‌های بهینه‌سازی شده
     """
 
     def __init__(self, config: KafkaConfig):
+        """
+        مقداردهی اولیه مصرف‌کننده Kafka
+
+        :param config: تنظیمات Kafka
+        """
         self.config = config
-        self._consumer = None
-        self._running = False
+        self.pool = KafkaConnectionPool(config)
+        self.retry_mechanism = RetryMechanism()
+        self.circuit_breaker = CircuitBreaker()
+        self.backpressure = BackpressureHandler()
 
-    def _create_consumer(self):
-        """ایجاد یک نمونه از مصرف‌کننده کافکا"""
-        if not self._consumer:
-            self._consumer = KafkaConsumer(self.config.get_consumer_config())
-
-    async def subscribe(self, topic: str, handler: Callable[[Message], Awaitable[None]]) -> None:
+    async def consume(self, topic: str, group_id: str, handler: Callable[[Message], Awaitable[None]]):
         """
-        اشتراک در یک موضوع و پردازش پیام‌ها
+        مصرف پیام‌های Kafka از یک `topic` مشخص
 
-        Args:
-            topic: نام موضوع
-            handler: تابعی که برای پردازش هر پیام فراخوانی می‌شود
+        :param topic: نام `topic`
+        :param group_id: `group.id` مربوط به مصرف‌کننده
+        :param handler: تابعی که پیام را پردازش می‌کند
         """
-        self._create_consumer()
-        self._consumer.subscribe([topic])
-        self._running = True
+        consumer = await self.pool.get_consumer(group_id)
+        consumer.subscribe([topic])
 
         try:
-            while self._running:
-                msg = self._consumer.poll(timeout=1.0)
-                if msg is None:
-                    continue
+            while True:
+                async with self.backpressure.semaphore:
+                    msg = consumer.poll(timeout=1.0)
 
-                if msg.error():
-                    logger.error(f"Consumer error: {msg.error()}")
-                    continue
+                    if msg is None:
+                        continue
 
-                try:
-                    # تبدیل پیام دریافتی به مدل Message
-                    value = json.loads(msg.value().decode('utf-8'))
-                    message = Message(
-                        topic=msg.topic(),
-                        content=value['content'],
-                        timestamp=datetime.fromisoformat(value['timestamp']),
-                        metadata=value.get('metadata')
-                    )
+                    if msg.error():
+                        logger.error(f"Consumer error: {msg.error()}")
+                        continue
 
-                    # فراخوانی handler برای پردازش پیام
-                    await handler(message)
+                    try:
+                        # تبدیل پیام دریافتی به مدل `Message`
+                        value = json.loads(msg.value().decode("utf-8"))
+                        message = Message(
+                            topic=msg.topic(),
+                            content=value.get("content"),
+                            metadata=value.get("metadata")
+                        )
 
-                except Exception as e:
-                    logger.error(f"Error processing message: {str(e)}")
+                        # استفاده از `Circuit Breaker` و `Retry Mechanism`
+                        await self.circuit_breaker.execute(
+                            self.retry_mechanism.execute, handler, message
+                        )
+
+                    except Exception as e:
+                        logger.error(f"Error processing message: {e}")
 
         finally:
-            self._consumer.close()
+            await self.pool.release_consumer(consumer)
 
     async def stop(self):
-        """توقف دریافت پیام‌ها"""
-        self._running = False
-        if self._consumer:
-            self._consumer.close()
+        """توقف مصرف‌کننده Kafka"""
+        await self.pool.close_all()

@@ -4,6 +4,6 @@
 تنظیمات اتصال، پارامترهای عملکردی و سایر تنظیمات در این بخش مدیریت می‌شوند.
 """
 
-from .settings import ClickHouseConfig, QuerySettings
+from .config import ClickHouseConfig
 
-__all__ = ['ClickHouseConfig', 'QuerySettings']
+__all__ = ['ClickHouseConfig']

@@ -1,66 +1,91 @@
-
-
-# infrastructure/kafka/adapters/producer.py
-from ..domain.models import Message
-from ..config.settings import KafkaConfig
-from ...interfaces import MessagingInterface
-from confluent_kafka import Producer as KafkaProducer
+import asyncio
 import json
 import logging
+from ..config.settings import KafkaConfig
+from ..domain.models import Message
+from ..adapters.connection_pool import KafkaConnectionPool
+from ..adapters.retry_mechanism import RetryMechanism
+from ..adapters.circuit_breaker import CircuitBreaker
+from ..service.message_cache import MessageCache
+from confluent_kafka import Producer as KafkaProducer
 
 logger = logging.getLogger(__name__)
 
 
 class MessageProducer:
     """
-    کلاس تولیدکننده پیام
-
-    این کلاس مسئولیت ارسال پیام‌ها به کافکا را بر عهده دارد.
+    تولیدکننده پیام Kafka با مکانیزم‌های بهینه‌سازی شده
     """
 
     def __init__(self, config: KafkaConfig):
-        self.config = config
-        self._producer = None
+        """
+        مقداردهی اولیه تولیدکننده Kafka
 
-    def _create_producer(self):
-        """ایجاد یک نمونه از تولیدکننده کافکا"""
-        if not self._producer:
-            self._producer = KafkaProducer(self.config.get_producer_config())
+        :param config: تنظیمات Kafka
+        """
+        self.config = config
+        self.pool = KafkaConnectionPool(config)
+        self.retry_mechanism = RetryMechanism()
+        self.circuit_breaker = CircuitBreaker()
+        self.cache = MessageCache()
 
     async def send(self, message: Message) -> None:
         """
-        ارسال یک پیام به کافکا
+        ارسال پیام به Kafka با مدیریت `Retry`, `Circuit Breaker`, و `Cache`
 
-        Args:
-            message: پیامی که باید ارسال شود
+        :param message: شیء پیام Kafka
         """
-        self._create_producer()
+        if await self.cache.is_duplicate(message.content):
+            logger.info(f"Duplicate message detected, skipping: {message.content}")
+            return
 
+        producer = await self.pool.get_producer()
         try:
-            # تبدیل محتوا به JSON
-            value = json.dumps({
-                'content': message.content,
-                'timestamp': message.timestamp.isoformat(),
-                'metadata': message.metadata
-            }).encode('utf-8')
+            payload = json.dumps({
+                "content": message.content,
+                "metadata": message.metadata
+            }).encode("utf-8")
 
-            # ارسال پیام
-            self._producer.produce(
+            await self.circuit_breaker.execute(
+                self.retry_mechanism.execute,
+                producer.produce,
                 topic=message.topic,
-                value=value,
-                on_delivery=self._delivery_report
+                value=payload
             )
-
-            # اطمینان از ارسال همه پیام‌های در صف
-            self._producer.flush()
+            producer.flush()
+            logger.info(f"Message sent to {message.topic}")
 
         except Exception as e:
-            logger.error(f"Error sending message to Kafka: {str(e)}")
-            raise
+            logger.error(f"Failed to send message: {e}")
+        finally:
+            await self.pool.release_producer(producer)
 
-    def _delivery_report(self, err, msg):
-        """گزارش وضعیت تحویل پیام"""
-        if err is not None:
-            logger.error(f'Message delivery failed: {str(err)}')
-        else:
-            logger.info(f'Message delivered to {msg.topic()} [{msg.partition()}]')
+    async def send_batch(self, messages: list[Message]) -> None:
+        """
+        ارسال دسته‌ای پیام‌ها به Kafka
+
+        :param messages: لیستی از پیام‌های Kafka
+        """
+        filtered_messages = [msg for msg in messages if not await self.cache.is_duplicate(msg.content)]
+
+        if not filtered_messages:
+            logger.info("No new messages to send.")
+            return
+
+        producer = await self.pool.get_producer()
+        try:
+            for message in filtered_messages:
+                payload = json.dumps({
+                    "content": message.content,
+                    "metadata": message.metadata
+                }).encode("utf-8")
+
+                producer.produce(topic=message.topic, value=payload)
+
+            producer.flush()
+            logger.info(f"Batch of {len(filtered_messages)} messages sent successfully.")
+
+        except Exception as e:
+            logger.error(f"Failed to send batch messages: {e}")
+        finally:
+            await self.pool.release_producer(producer)

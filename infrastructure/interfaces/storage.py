@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from typing import List, Any, Optional
 
+
 class StorageInterface(ABC):
     """
     اینترفیس پایه برای ذخیره‌سازی داده
@@ -74,6 +75,20 @@ class StorageInterface(ABC):
         Args:
             table_name: نام جدول
             schema: ساختار جدول
+        """
+        pass
+
+    @abstractmethod
+    async def save(self, file_data: bytes, file_path: str) -> str:
+        """
+        ذخیره فایل در سیستم ذخیره‌سازی
+
+        Args:
+            file_data: داده‌های فایل به صورت باینری
+            file_path: مسیر ذخیره‌سازی فایل
+
+        Returns:
+            str: آدرس دسترسی به فایل ذخیره شده
         """
         pass
 

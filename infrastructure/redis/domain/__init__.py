@@ -1,9 +1,10 @@
-# infrastructure/redis/domain/__init__.py
 """
-این ماژول شامل مدل‌های دامنه برای کار با ردیس است.
-ساختارهای داده پایه مانند CacheItem و CacheNamespace در اینجا تعریف می‌شوند.
+ماژول Domain شامل مدل‌های داده‌ای و ابزارهای پردازش داده در Redis می‌باشد.
 """
-
 from .models import CacheItem, CacheNamespace
+from .compression import Compression
+from .encryption import EncryptedRedisAdapter
 
-__all__ = ['CacheItem', 'CacheNamespace']
+__all__ = ["CacheItem", "CacheNamespace", "Compression", "EncryptedRedisAdapter"]
+
+

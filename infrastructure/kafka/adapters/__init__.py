@@ -1,10 +1,15 @@
-# infrastructure/kafka/adapters/__init__.py
-"""
-این ماژول شامل تطبیق‌دهنده‌های کافکا است که مسئول ارتباط مستقیم با سرور کافکا هستند.
-Producer و Consumer اصلی در این بخش تعریف شده‌اند.
-"""
-
 from .consumer import MessageConsumer
 from .producer import MessageProducer
+from .connection_pool import KafkaConnectionPool
+from .circuit_breaker import CircuitBreaker
+from .retry_mechanism import RetryMechanism
+from .backpressure import BackpressureHandler
 
-__all__ = ['MessageConsumer', 'MessageProducer']
+__all__ = [
+    "MessageConsumer",
+    "MessageProducer",
+    "KafkaConnectionPool",
+    "CircuitBreaker",
+    "RetryMechanism",
+    "BackpressureHandler",
+]

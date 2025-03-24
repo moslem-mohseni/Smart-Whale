@@ -1,192 +1,252 @@
 # infrastructure/clickhouse/service/analytics_cache.py
-
 import logging
-import json
 import hashlib
-from typing import Optional, Any, Dict
-from datetime import datetime, timedelta
-from dataclasses import asdict
-
-from ..domain.models import AnalyticsQuery, AnalyticsResult
-from ...redis import CacheService
+import json
+from typing import Optional, Any, Dict, Union
+from ..config.config import config
+from ..exceptions import OperationalError
+from ...redis.adapters.redis_adapter import RedisAdapter
 from ...redis.config.settings import RedisConfig
-from ...redis.domain.models import CacheNamespace
 
 logger = logging.getLogger(__name__)
 
 
 class AnalyticsCache:
     """
-    سیستم کش‌گذاری برای نتایج تحلیلی
+    مدیریت کش برای نتایج تحلیلی ClickHouse
 
-    این کلاس مسئول کش کردن نتایج پرس‌وجوهای تحلیلی پرتکرار است و
-    از Redis برای ذخیره‌سازی استفاده می‌کند.
+    این کلاس از Redis برای کش کردن نتایج کوئری‌های تحلیلی استفاده می‌کند
+    و امکان ذخیره، بازیابی و حذف نتایج را فراهم می‌کند.
     """
 
-    def __init__(self, redis_config: RedisConfig):
+    def __init__(self, redis_config: Optional[RedisConfig] = None):
         """
-        راه‌اندازی سیستم کش
+        مقداردهی اولیه کش تحلیلی
 
         Args:
-            redis_config: تنظیمات اتصال به Redis
+            redis_config (RedisConfig, optional): تنظیمات Redis
+                اگر ارائه نشود، یک نمونه پیش‌فرض ایجاد می‌شود.
         """
-        self.cache_service = CacheService(redis_config)
-        self.namespace = CacheNamespace(
-            name="analytics",
-            default_ttl=3600,  # یک ساعت پیش‌فرض
-            max_size=1000000  # حداکثر یک میلیون کلید
-        )
+        self.redis_config = redis_config or RedisConfig()
+        self._adapter = RedisAdapter(self.redis_config)
+        self._connected = False
 
-    async def initialize(self) -> None:
-        """راه‌اندازی اولیه کش"""
-        await self.cache_service.connect()
-        self.cache_service.create_namespace(self.namespace)
-        logger.info("Analytics cache initialized")
+        # دریافت TTL پیش‌فرض از تنظیمات مرکزی
+        monitoring_config = config.get_monitoring_config()
+        self.default_ttl = int(monitoring_config.get("cache_ttl", 3600))
 
-    async def shutdown(self) -> None:
-        """خاتمه سرویس کش"""
-        await self.cache_service.disconnect()
-        logger.info("Analytics cache shut down")
+        logger.info(f"Analytics Cache initialized with default TTL: {self.default_ttl}s")
 
-    def _generate_cache_key(self, query: AnalyticsQuery) -> str:
+    async def connect(self) -> None:
         """
-        تولید کلید یکتا برای پرس‌وجو
+        برقراری اتصال به Redis
+
+        Raises:
+            OperationalError: در صورت بروز خطا در اتصال به Redis
+        """
+        if self._connected:
+            return
+
+        try:
+            await self._adapter.connect()
+            self._connected = True
+            logger.debug("Successfully connected to Redis cache")
+        except Exception as e:
+            error_msg = f"Failed to connect to Redis cache: {str(e)}"
+            logger.error(error_msg)
+            raise OperationalError(message=error_msg, code="CHE601")
+
+    async def disconnect(self) -> None:
+        """
+        قطع اتصال از Redis
+        """
+        if not self._connected:
+            return
+
+        try:
+            await self._adapter.disconnect()
+            self._connected = False
+            logger.debug("Disconnected from Redis cache")
+        except Exception as e:
+            logger.warning(f"Error disconnecting from Redis cache: {str(e)}")
+
+    async def _ensure_connected(self) -> None:
+        """
+        اطمینان از برقراری اتصال به Redis
+
+        Raises:
+            OperationalError: اگر اتصال به Redis برقرار نباشد و تلاش برای اتصال ناموفق باشد
+        """
+        if not self._connected:
+            await self.connect()
+
+    def _generate_cache_key(self, query: str, params: Optional[Dict[str, Any]] = None) -> str:
+        """
+        تولید کلید یکتا برای ذخیره‌سازی کوئری در کش
+
+        از ترکیب کوئری و پارامترهای آن یک هش SHA-256 ایجاد می‌کند
+        که به عنوان کلید کش استفاده می‌شود.
 
         Args:
-            query: پرس‌وجوی تحلیلی
+            query (str): متن کوئری
+            params (Dict[str, Any], optional): پارامترهای کوئری
 
         Returns:
-            کلید یکتا برای کش
+            str: کلید کش
         """
-        # تبدیل پرس‌وجو به دیکشنری
-        query_dict = {
-            'dimensions': sorted(query.dimensions),
-            'metrics': sorted(query.metrics),
-            'filters': json.dumps(query.filters, sort_keys=True) if query.filters else None,
-            'time_range': [dt.isoformat() for dt in query.time_range] if query.time_range else None,
-            'limit': query.limit,
-            'order_by': sorted(query.order_by) if query.order_by else None
-        }
+        # ایجاد یک رشته ترکیبی از کوئری و پارامترها
+        key_data = query
+        if params:
+            try:
+                # مرتب‌سازی کلیدها برای ثبات کلید کش
+                key_data += json.dumps(params, sort_keys=True)
+            except (TypeError, ValueError):
+                logger.warning("Failed to serialize params for cache key")
 
-        # تولید کلید با استفاده از هش
-        query_str = json.dumps(query_dict, sort_keys=True)
-        return f"query:{hashlib.sha256(query_str.encode()).hexdigest()}"
+        return f"analytics_cache:{hashlib.sha256(key_data.encode()).hexdigest()}"
 
-    async def get_cached_result(self, query: AnalyticsQuery) -> Optional[AnalyticsResult]:
+    async def get_cached_result(self, query: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
         """
-        بازیابی نتیجه از کش
+        دریافت نتیجه کش شده برای یک کوئری تحلیلی
 
         Args:
-            query: پرس‌وجوی تحلیلی
+            query (str): متن کوئری
+            params (Dict[str, Any], optional): پارامترهای کوئری
 
         Returns:
-            نتیجه کش شده یا None
+            Any: نتیجه کش شده یا None در صورت عدم وجود
+
+        Raises:
+            OperationalError: در صورت بروز خطا در دسترسی به کش
         """
         try:
-            cache_key = self._generate_cache_key(query)
-            cached_data = await self.cache_service.get(cache_key, namespace=self.namespace.name)
+            await self._ensure_connected()
 
-            if cached_data:
-                return AnalyticsResult(
-                    query=query,
-                    data=cached_data['data'],
-                    total_count=cached_data['total_count'],
-                    execution_time=cached_data['execution_time'],
-                    metadata={'from_cache': True}
-                )
+            cache_key = self._generate_cache_key(query, params)
+            cached_data = await self._adapter.get(cache_key)
 
-            return None
+            if not cached_data:
+                logger.debug(f"Cache miss for query: {query[:50]}...")
+                return None
 
+            # تبدیل JSON به دیکشنری
+            try:
+                result = json.loads(cached_data)
+                logger.debug(f"Cache hit for query: {query[:50]}...")
+                return result
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON data in cache for key: {cache_key}")
+                # حذف خودکار داده نامعتبر
+                await self._adapter.delete(cache_key)
+                return None
+
+        except OperationalError:
+            # خطاهای عملیاتی را منتقل می‌کنیم
+            raise
         except Exception as e:
-            logger.warning(f"Error retrieving from cache: {str(e)}")
-            return None
+            error_msg = f"Error retrieving data from cache: {str(e)}"
+            logger.error(error_msg)
+            raise OperationalError(message=error_msg, code="CHE603")
 
-    async def cache_result(self, result: AnalyticsResult, ttl: Optional[int] = None) -> None:
+    async def set_cached_result(self, query: str, result: Any,
+                                ttl: Optional[int] = None,
+                                params: Optional[Dict[str, Any]] = None) -> None:
         """
-        ذخیره نتیجه در کش
+        ذخیره نتیجه کوئری تحلیلی در کش
 
         Args:
-            result: نتیجه تحلیلی
-            ttl: زمان انقضا به ثانیه (اختیاری)
+            query (str): متن کوئری
+            result (Any): نتیجه کوئری
+            ttl (int, optional): زمان انقضا (ثانیه)
+            params (Dict[str, Any], optional): پارامترهای کوئری
+
+        Raises:
+            OperationalError: در صورت بروز خطا در ذخیره‌سازی در کش
         """
         try:
-            cache_key = self._generate_cache_key(result.query)
-            cache_data = {
-                'data': result.data,
-                'total_count': result.total_count,
-                'execution_time': result.execution_time,
-                'cached_at': datetime.now().isoformat()
-            }
+            await self._ensure_connected()
 
-            await self.cache_service.set(
-                key=cache_key,
-                value=cache_data,
-                ttl=ttl,
-                namespace=self.namespace.name
-            )
-            logger.debug(f"Cached result for key: {cache_key}")
+            cache_key = self._generate_cache_key(query, params)
+            ttl_value = ttl if ttl is not None else self.default_ttl
 
+            # تبدیل نتیجه به JSON
+            try:
+                serialized_result = json.dumps(result)
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Failed to serialize result to JSON: {str(e)}")
+                return
+
+            await self._adapter.set(cache_key, serialized_result, ttl_value)
+            logger.debug(f"Cached result for query with TTL: {ttl_value}s")
+
+        except OperationalError:
+            # خطاهای عملیاتی را منتقل می‌کنیم
+            raise
         except Exception as e:
-            logger.warning(f"Error caching result: {str(e)}")
+            error_msg = f"Error caching result: {str(e)}"
+            logger.error(error_msg)
+            raise OperationalError(message=error_msg, code="CHE604")
 
-    async def invalidate_cache(self, pattern: Optional[str] = None) -> None:
+    async def invalidate_cache(self, query: Optional[str] = None,
+                               params: Optional[Dict[str, Any]] = None) -> None:
         """
-        حذف داده‌های کش
+        حذف کش یک کوئری خاص یا پاکسازی کل کش
 
         Args:
-            pattern: الگوی کلیدهای مورد نظر برای حذف (اختیاری)
+            query (str, optional): متن کوئری. اگر None باشد، کل کش پاک می‌شود.
+            params (Dict[str, Any], optional): پارامترهای کوئری
+
+        Raises:
+            OperationalError: در صورت بروز خطا در حذف کش
         """
         try:
-            if pattern:
-                keys = await self.cache_service.scan_keys(
-                    pattern,
-                    namespace=self.namespace.name
-                )
-                for key in keys:
-                    await self.cache_service.delete(key, namespace=self.namespace.name)
+            await self._ensure_connected()
+
+            if query:
+                # حذف کش یک کوئری خاص
+                cache_key = self._generate_cache_key(query, params)
+                await self._adapter.delete(cache_key)
+                logger.debug(f"Invalidated cache key for query: {query[:50]}...")
             else:
-                # حذف کل namespace
-                await self.cache_service.delete_namespace(self.namespace.name)
+                # پاکسازی کل کش
+                await self._adapter.flush()
+                logger.info("Analytics cache cleared successfully")
 
-            logger.info(f"Invalidated cache with pattern: {pattern or 'all'}")
-
+        except OperationalError:
+            # خطاهای عملیاتی را منتقل می‌کنیم
+            raise
         except Exception as e:
-            logger.error(f"Error invalidating cache: {str(e)}")
+            error_msg = f"Error invalidating cache: {str(e)}"
+            logger.error(error_msg)
+            raise OperationalError(message=error_msg, code="CHE605")
 
-    async def get_cache_stats(self) -> Dict[str, Any]:
+    async def get_stats(self) -> Dict[str, Any]:
         """
         دریافت آمار کش
 
         Returns:
-            دیکشنری حاوی آمار کش
+            Dict[str, Any]: آمار مربوط به کش
+
+        Raises:
+            OperationalError: در صورت بروز خطا در دریافت آمار
         """
         try:
-            keys = await self.cache_service.scan_keys(
-                "*",
-                namespace=self.namespace.name
-            )
+            await self._ensure_connected()
 
-            total_keys = len(keys)
-            memory_used = 0
-            expired_keys = 0
+            # تعداد کلیدها
+            key_count = 0
+            if hasattr(self._adapter, 'dbsize'):
+                key_count = await self._adapter.dbsize()
 
-            for key in keys:
-                ttl = await self.cache_service.ttl(key, namespace=self.namespace.name)
-                if ttl == 0:
-                    expired_keys += 1
-
-                # محاسبه تقریبی حجم اشغال شده
-                value = await self.cache_service.get(key, namespace=self.namespace.name)
-                if value:
-                    memory_used += len(str(value))
-
-            return {
-                'total_keys': total_keys,
-                'expired_keys': expired_keys,
-                'memory_used_bytes': memory_used,
-                'hit_rate': await self.cache_service.get_hit_rate(self.namespace.name)
+            stats = {
+                "key_count": key_count,
+                "default_ttl": self.default_ttl,
+                "connected": self._connected
             }
 
+            return stats
+
         except Exception as e:
-            logger.error(f"Error getting cache stats: {str(e)}")
-            return {}
+            error_msg = f"Error getting cache stats: {str(e)}"
+            logger.error(error_msg)
+            raise OperationalError(message=error_msg, code="CHE607")

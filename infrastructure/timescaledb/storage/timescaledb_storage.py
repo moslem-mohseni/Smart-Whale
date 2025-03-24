@@ -1,221 +1,103 @@
-# infrastructure/timescaledb/storage/timescaledb_storage.py
-
-import asyncpg
 import logging
-from typing import List, Any, Optional, Dict
-from ...interfaces import StorageInterface, ConnectionError, OperationError
-from ..config.settings import TimescaleDBConfig
+from typing import Any, List, Optional
+from ..config.connection_pool import ConnectionPool
+from ..config.read_write_split import ReadWriteSplitter
 
 logger = logging.getLogger(__name__)
 
-class TimescaleDBStorage(StorageInterface):
-    """
-    پیاده‌سازی StorageInterface برای TimescaleDB
 
-    این کلاس امکان کار با TimescaleDB را با استفاده از asyncpg فراهم می‌کند.
-    قابلیت‌های خاص TimescaleDB مثل hypertable نیز پشتیبانی می‌شوند.
-    """
+class TimescaleDBStorage:
+    """مدیریت اجرای کوئری‌ها در TimescaleDB"""
 
-    def __init__(self, config: TimescaleDBConfig):
+    def __init__(self, connection_pool: ConnectionPool):
         """
-        مقداردهی اولیه storage با تنظیمات داده شده
+        مقداردهی اولیه کلاس
 
         Args:
-            config: تنظیمات اتصال به دیتابیس
+            connection_pool (ConnectionPool): مدیریت Connection Pool
         """
-        self.config = config
-        self._pool = None
-        self._transaction = None
+        self.connection_pool = connection_pool
+        self.splitter = ReadWriteSplitter(connection_pool)
 
-    async def connect(self) -> None:
+    async def execute_query(self, query: str, params: Optional[List[Any]] = None) -> List[Any]:
         """
-        برقراری اتصال به دیتابیس
-
-        Raises:
-            ConnectionError: در صورت بروز خطا در اتصال
-        """
-        try:
-            self._pool = await asyncpg.create_pool(
-                dsn=self.config.get_connection_string(),
-                min_size=self.config.min_connections,
-                max_size=self.config.max_connections,
-                command_timeout=self.config.connection_timeout
-            )
-            # فعال‌سازی TimescaleDB
-            async with self._pool.acquire() as conn:
-                await conn.execute('CREATE EXTENSION IF NOT EXISTS timescaledb')
-            logger.info("Successfully connected to TimescaleDB")
-        except Exception as e:
-            logger.error(f"Failed to connect to TimescaleDB: {str(e)}")
-            raise ConnectionError(f"Could not connect to TimescaleDB: {str(e)}")
-
-    async def disconnect(self) -> None:
-        """قطع اتصال از دیتابیس"""
-        if self._pool:
-            await self._pool.close()
-            self._pool = None
-            logger.info("Disconnected from TimescaleDB")
-
-    async def is_connected(self) -> bool:
-        """
-        بررسی وضعیت اتصال
-
-        Returns:
-            True اگر اتصال برقرار باشد
-        """
-        if not self._pool:
-            return False
-        try:
-            async with self._pool.acquire() as conn:
-                await conn.execute('SELECT 1')
-            return True
-        except Exception:
-            return False
-
-    async def execute(self, query: str, params: Optional[List[Any]] = None) -> List[Any]:
-        """
-        اجرای یک پرس‌وجو
+        اجرای یک کوئری در دیتابیس
 
         Args:
-            query: پرس‌وجوی SQL
-            params: پارامترهای پرس‌وجو (اختیاری)
+            query (str): متن کوئری SQL
+            params (Optional[List[Any]]): مقادیر موردنیاز برای کوئری (در صورت نیاز)
 
         Returns:
-            نتیجه پرس‌وجو
-
-        Raises:
-            OperationError: در صورت بروز خطا در اجرای پرس‌وجو
+            List[Any]: نتیجه اجرای کوئری
         """
         try:
-            if self._transaction:
-                result = await self._transaction.fetch(query, *(params or []))
-            else:
-                async with self._pool.acquire() as conn:
-                    result = await conn.fetch(query, *(params or []))
-            return [dict(row) for row in result]
+            result = await self.splitter.execute_query(query, params)
+            return result
         except Exception as e:
-            logger.error(f"Error executing query: {str(e)}")
-            raise OperationError(f"Query execution failed: {str(e)}")
+            logger.error(f"❌ خطا در اجرای کوئری: {e}")
+            raise
 
     async def execute_many(self, query: str, params_list: List[List[Any]]) -> None:
         """
-        اجرای یک پرس‌وجو با چندین سری پارامتر
+        اجرای یک کوئری برای چندین مجموعه پارامتر
 
         Args:
-            query: پرس‌وجوی SQL
-            params_list: لیست پارامترها
-
-        Raises:
-            OperationError: در صورت بروز خطا در اجرای پرس‌وجو
+            query (str): متن کوئری SQL
+            params_list (List[List[Any]]): لیست پارامترها برای هر اجرا
         """
+        connection = await self.connection_pool.get_connection(read_only=False)
         try:
-            if self._transaction:
-                await self._transaction.executemany(query, params_list)
-            else:
-                async with self._pool.acquire() as conn:
-                    await conn.executemany(query, params_list)
+            async with connection.transaction():
+                await connection.executemany(query, params_list)
+            logger.info("✅ اجرای دسته‌ای کوئری با موفقیت انجام شد.")
         except Exception as e:
-            logger.error(f"Error executing batch query: {str(e)}")
-            raise OperationError(f"Batch query execution failed: {str(e)}")
+            logger.error(f"❌ خطا در اجرای دسته‌ای کوئری: {e}")
+            raise
+        finally:
+            await self.connection_pool.release_connection(connection, read_only=False)
 
-    async def begin_transaction(self) -> None:
+    async def begin_transaction(self) -> Any:
         """
         شروع یک تراکنش جدید
 
-        Raises:
-            OperationError: در صورت بروز خطا در شروع تراکنش
+        Returns:
+            asyncpg.transaction: شیء تراکنش
         """
-        if self._transaction:
-            raise OperationError("Transaction already in progress")
-        try:
-            conn = await self._pool.acquire()
-            self._transaction = conn.transaction()
-            await self._transaction.start()
-        except Exception as e:
-            logger.error(f"Error starting transaction: {str(e)}")
-            raise OperationError(f"Could not start transaction: {str(e)}")
+        connection = await self.connection_pool.get_connection(read_only=False)
+        transaction = connection.transaction()
+        await transaction.start()
+        return transaction, connection
 
-    async def commit(self) -> None:
+    async def commit_transaction(self, transaction: Any, connection: Any) -> None:
         """
-        تایید تراکنش جاری
-
-        Raises:
-            OperationError: در صورت بروز خطا در تایید تراکنش
-        """
-        if not self._transaction:
-            raise OperationError("No transaction in progress")
-        try:
-            await self._transaction.commit()
-        except Exception as e:
-            logger.error(f"Error committing transaction: {str(e)}")
-            raise OperationError(f"Could not commit transaction: {str(e)}")
-        finally:
-            self._transaction = None
-            await self._pool.release(self._transaction.connection)
-
-    async def rollback(self) -> None:
-        """
-        برگشت تراکنش جاری
-
-        Raises:
-            OperationError: در صورت بروز خطا در برگشت تراکنش
-        """
-        if not self._transaction:
-            raise OperationError("No transaction in progress")
-        try:
-            await self._transaction.rollback()
-        except Exception as e:
-            logger.error(f"Error rolling back transaction: {str(e)}")
-            raise OperationError(f"Could not rollback transaction: {str(e)}")
-        finally:
-            self._transaction = None
-            await self._pool.release(self._transaction.connection)
-
-    async def create_table(self, table_name: str, schema: Dict[str, str]) -> None:
-        """
-        ایجاد جدول جدید
+        تأیید تراکنش و اعمال تغییرات
 
         Args:
-            table_name: نام جدول
-            schema: ساختار جدول به صورت دیکشنری {نام_ستون: نوع_داده}
-
-        Raises:
-            OperationError: در صورت بروز خطا در ایجاد جدول
+            transaction (asyncpg.transaction): شیء تراکنش
+            connection (asyncpg.Connection): اتصال پایگاه داده
         """
         try:
-            columns = [f"{name} {dtype}" for name, dtype in schema.items()]
-            query = f"""
-                CREATE TABLE IF NOT EXISTS {table_name} (
-                    {', '.join(columns)}
-                )
-            """
-            await self.execute(query)
-            logger.info(f"Created table: {table_name}")
+            await transaction.commit()
+            logger.info("✅ تراکنش با موفقیت تأیید شد.")
         except Exception as e:
-            logger.error(f"Error creating table {table_name}: {str(e)}")
-            raise OperationError(f"Could not create table: {str(e)}")
+            logger.error(f"❌ خطا در تأیید تراکنش: {e}")
+            raise
+        finally:
+            await self.connection_pool.release_connection(connection, read_only=False)
 
-    async def create_hypertable(self, table_name: str, time_column: str) -> None:
+    async def rollback_transaction(self, transaction: Any, connection: Any) -> None:
         """
-        تبدیل یک جدول به hypertable
+        لغو تراکنش و بازگرداندن تغییرات
 
         Args:
-            table_name: نام جدول
-            time_column: نام ستون زمان
-
-        Raises:
-            OperationError: در صورت بروز خطا در تبدیل جدول
+            transaction (asyncpg.transaction): شیء تراکنش
+            connection (asyncpg.Connection): اتصال پایگاه داده
         """
         try:
-            query = f"""
-                SELECT create_hypertable(
-                    '{table_name}',
-                    '{time_column}',
-                    if_not_exists => TRUE
-                )
-            """
-            await self.execute(query)
-            logger.info(f"Created hypertable for: {table_name}")
+            await transaction.rollback()
+            logger.info("🔄 تراکنش لغو شد.")
         except Exception as e:
-            logger.error(f"Error creating hypertable for {table_name}: {str(e)}")
-            raise OperationError(f"Could not create hypertable: {str(e)}")
+            logger.error(f"❌ خطا در لغو تراکنش: {e}")
+            raise
+        finally:
+            await self.connection_pool.release_connection(connection, read_only=False)

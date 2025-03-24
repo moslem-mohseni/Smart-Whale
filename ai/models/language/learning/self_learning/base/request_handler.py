@@ -8,6 +8,7 @@ RequestHandler Module
 
 import asyncio
 import logging
+from abc import ABC
 from typing import Callable, Dict, Any, Optional, Coroutine, List
 
 from .base_component import BaseComponent
@@ -16,7 +17,8 @@ from .base_component import BaseComponent
 # و یک coroutine بازمی‌گرداند که خروجی آن یک دیکشنری یا None است.
 RequestHandlerFunction = Callable[[Dict[str, Any]], Coroutine[None, None, Optional[Dict[str, Any]]]]
 
-class RequestHandler(BaseComponent):
+
+class RequestHandler(BaseComponent, ABC):
     """
     کلاس RequestHandler به عنوان مرکز مدیریت درخواست‌های ورودی سیستم خودآموزی.
 

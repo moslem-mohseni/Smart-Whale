@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Optional
 
 from .need_detector_base import NeedDetectorBase
 
+
 class GapAnalyzer(NeedDetectorBase):
     """
     GapAnalyzer برای شناسایی شکاف‌های دانشی مدل با مقایسه لیست‌های موضوعات مورد انتظار و پوشش داده‌شده طراحی شده است.

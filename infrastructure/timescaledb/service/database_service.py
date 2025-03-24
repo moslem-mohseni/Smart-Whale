@@ -1,130 +1,141 @@
-# infrastructure/timescaledb/service/database_service.py
-
 import logging
-from typing import Optional, List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datetime import datetime
-from ..config.settings import TimescaleDBConfig
-from ..domain.models import TimeSeriesData, TableSchema
-from ...interfaces import StorageInterface, ConnectionError, OperationError
+
+from infrastructure.timescaledb.storage.timescaledb_storage import TimescaleDBStorage
+from infrastructure.timescaledb.optimization.cache_manager import CacheManager
+from infrastructure.timescaledb.monitoring.metrics_collector import MetricsCollector
+from infrastructure.timescaledb.monitoring.slow_query_analyzer import SlowQueryAnalyzer
+from infrastructure.timescaledb.monitoring.health_check import HealthCheck
 
 logger = logging.getLogger(__name__)
 
 
-class TimescaleDBService:
-    """سرویس مدیریت ارتباط با TimescaleDB"""
+class DatabaseService:
+    """سرویس مدیریت TimescaleDB"""
 
-    def __init__(self, config: TimescaleDBConfig):
-        self.config = config
-        self._storage: Optional[StorageInterface] = None
+    def __init__(
+        self,
+        storage: TimescaleDBStorage,
+        cache_manager: CacheManager,
+        metrics_collector: MetricsCollector,
+        slow_query_analyzer: SlowQueryAnalyzer,
+        health_check: HealthCheck
+    ):
+        """
+        مقداردهی اولیه سرویس پایگاه داده
 
-    async def initialize(self) -> None:
-        """راه‌اندازی اولیه سرویس"""
-        storage = await self.get_storage()
-        await storage.connect()
+        Args:
+            storage (TimescaleDBStorage): مدیریت ذخیره‌سازی
+            cache_manager (CacheManager): مدیریت کش کوئری‌ها
+            metrics_collector (MetricsCollector): جمع‌آوری متریک‌ها
+            slow_query_analyzer (SlowQueryAnalyzer): تحلیل کوئری‌های کند
+            health_check (HealthCheck): بررسی سلامت سیستم
+        """
+        self.storage = storage
+        self.cache_manager = cache_manager
+        self.metrics_collector = metrics_collector
+        self.slow_query_analyzer = slow_query_analyzer
+        self.health_check = health_check
 
-    async def shutdown(self) -> None:
-        """خاتمه سرویس"""
-        if self._storage:
-            await self._storage.disconnect()
+    async def execute_query(self, query: str,
+                            params: Optional[List[Any]] = None, use_cache: bool = True) -> List[Dict[str, Any]]:
+        """
+        اجرای کوئری با پشتیبانی از کش
 
-    async def get_storage(self) -> StorageInterface:
-        """دریافت اتصال به دیتابیس"""
-        if not self._storage or not await self._storage.is_connected():
-            self._storage = self._create_storage()
-            await self._storage.connect()
-        return self._storage
+        Args:
+            query (str): متن کوئری SQL
+            params (Optional[List[Any]]): پارامترهای کوئری
+            use_cache (bool): استفاده از کش در صورت امکان
 
-    def _create_storage(self) -> StorageInterface:
-        """ایجاد نمونه جدید از کلاس Storage"""
-        from ..storage.timescaledb_storage import TimescaleDBStorage
-        return TimescaleDBStorage(self.config)
+        Returns:
+            List[Dict[str, Any]]: نتیجه اجرای کوئری
+        """
+        cache_key = f"query_cache:{query}:{params}"
+        if use_cache:
+            cached_result = await self.cache_manager.get_cached_result(cache_key)
+            if cached_result:
+                logger.info(f"⚡ استفاده از کش برای کوئری: {query}")
+                return cached_result
 
-    async def store_time_series_data(self, data: TimeSeriesData) -> None:
-        """ذخیره‌سازی داده‌های سری زمانی"""
-        storage = await self.get_storage()
-        query = """
-            INSERT INTO time_series_data (id, timestamp, value, metadata)
+        result = await self.storage.execute_query(query, params)
+
+        if use_cache:
+            await self.cache_manager.cache_result(cache_key, result)
+        return result
+
+    async def store_time_series_data(self, table: str, id: int, timestamp: datetime,
+                                     value: float, metadata: Dict[str, Any]):
+        """
+        ذخیره داده‌های سری‌زمانی
+
+        Args:
+            table (str): نام جدول
+            id (int): شناسه
+            timestamp (datetime): زمان ثبت داده
+            value (float): مقدار عددی داده
+            metadata (Dict[str, Any]): اطلاعات متا مرتبط
+        """
+        query = f"""
+            INSERT INTO {table} (id, timestamp, value, metadata)
             VALUES ($1, $2, $3, $4)
         """
-        await storage.execute(query, [data.id, data.timestamp, data.value, data.metadata])
+        await self.execute_query(query, [id, timestamp, value, metadata], use_cache=False)
+        logger.info(f"✅ داده سری‌زمانی ذخیره شد: {id} -> {value}")
 
-    async def get_time_series_data(self, id: str) -> Optional[Dict]:
-        """بازیابی داده‌های سری زمانی با شناسه"""
-        storage = await self.get_storage()
-        query = "SELECT * FROM time_series_data WHERE id = $1"
-        result = await storage.execute(query, [id])
-        return result[0] if result else None
-
-    async def aggregate_time_series(self, metric: str, interval: str,
-                                    start_time: datetime, end_time: datetime) -> List[Dict]:
-        """تجمیع داده‌های سری زمانی"""
-        storage = await self.get_storage()
-        query = f"""
-            SELECT time_bucket($1, timestamp) as bucket,
-                   avg({metric}) as avg_value
-            FROM time_series_data
-            WHERE timestamp BETWEEN $2 AND $3
-            GROUP BY bucket
-            ORDER BY bucket
+    async def get_time_series_data(self, table: str, start_time: datetime, end_time: datetime) -> List[Dict[str, Any]]:
         """
-        return await storage.execute(query, [interval, start_time, end_time])
+        دریافت داده‌های سری‌زمانی در بازه مشخص
 
-    async def create_continuous_aggregate(self, view_name: str, table_name: str,
-                                          interval: str, aggregates: List[str]) -> None:
-        """ایجاد تجمیع مستمر"""
-        storage = await self.get_storage()
-        agg_expressions = ", ".join(aggregates)
-        query = f"""
-            CREATE MATERIALIZED VIEW {view_name}
-            WITH (timescaledb.continuous) AS
-            SELECT time_bucket('{interval}', timestamp) AS bucket,
-                   {agg_expressions}
-            FROM {table_name}
-            GROUP BY bucket
+        Args:
+            table (str): نام جدول
+            start_time (datetime): زمان شروع بازه
+            end_time (datetime): زمان پایان بازه
+
+        Returns:
+            List[Dict[str, Any]]: لیست داده‌های سری‌زمانی
         """
-        await storage.execute(query)
-
-    async def set_retention_policy(self, table_name: str, interval: str) -> None:
-        """تنظیم سیاست نگهداری داده"""
-        storage = await self.get_storage()
         query = f"""
-            ALTER TABLE {table_name} SET (
-                timescaledb.drop_after = '{interval}'::interval
-            )
+            SELECT * FROM {table}
+            WHERE timestamp BETWEEN $1 AND $2
+            ORDER BY timestamp ASC
         """
-        await storage.execute(query)
+        return await self.execute_query(query, [start_time, end_time])
 
-    async def set_compression_policy(self, table_name: str, segment_by: str,
-                                     order_by: str) -> None:
-        """تنظیم سیاست فشرده‌سازی"""
-        storage = await self.get_storage()
-        query = f"""
-            ALTER TABLE {table_name} SET (
-                timescaledb.compress = true,
-                timescaledb.compress_segmentby = '{segment_by}',
-                timescaledb.compress_orderby = '{order_by}'
-            )
+    async def get_database_metrics(self) -> Dict[str, Any]:
         """
-        await storage.execute(query)
+        دریافت متریک‌های پایگاه داده
 
-    async def create_hypertable(self, schema: TableSchema,
-                                partition_interval: str) -> None:
-        """ایجاد جدول و تبدیل به hypertable"""
-        storage = await self.get_storage()
+        Returns:
+            Dict[str, Any]: اطلاعات مصرف منابع و سلامت پایگاه داده
+        """
+        return await self.metrics_collector.get_database_metrics()
 
-        # ایجاد جدول
-        await storage.create_table(schema.name, schema.columns)
+    async def get_slow_queries(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        دریافت لیستی از کندترین کوئری‌ها
 
-        # تبدیل به hypertable
-        if schema.time_column:
-            await storage.create_hypertable(
-                schema.name,
-                schema.time_column,
-                interval=partition_interval
-            )
+        Args:
+            limit (int): تعداد کوئری‌های کند مورد نظر
 
-        # ایجاد ایندکس‌ها
-        if schema.indexes:
-            for name, definition in schema.indexes.items():
-                query = f"CREATE INDEX IF NOT EXISTS {name} ON {schema.name} {definition}"
-                await storage.execute(query)
+        Returns:
+            List[Dict[str, Any]]: لیست کوئری‌های کند به همراه جزئیات
+        """
+        return await self.slow_query_analyzer.get_slow_queries(limit)
+
+    async def check_health(self) -> Dict[str, Any]:
+        """
+        بررسی وضعیت سلامت پایگاه داده
+
+        Returns:
+            Dict[str, Any]: وضعیت کلی سلامت پایگاه داده
+        """
+        connection_status = await self.health_check.check_connection()
+        resource_usage = await self.health_check.get_resource_usage()
+        critical_issues = await self.health_check.check_critical_issues()
+
+        return {
+            "connection_status": connection_status,
+            "resource_usage": resource_usage,
+            "critical_issues": critical_issues
+        }

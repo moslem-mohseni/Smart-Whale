@@ -1,181 +1,196 @@
 # infrastructure/clickhouse/service/analytics_service.py
-
 import logging
-from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
-
+from typing import Optional, List, Dict, Any, Union
+from ..config.config import config
 from ..adapters.clickhouse_adapter import ClickHouseAdapter
-from ..config.settings import ClickHouseConfig, QuerySettings
-from ..domain.models import (
-    AnalyticsEvent,
-    AnalyticsQuery,
-    AnalyticsResult,
-    TableSchema
-)
+from ..optimization.query_optimizer import QueryOptimizer
+from ..domain.models import AnalyticsQuery, AnalyticsResult
+from ..exceptions import QueryError, OperationalError
 from .analytics_cache import AnalyticsCache
-from ...redis.config.settings import RedisConfig
-from ...interfaces.exceptions import ConnectionError, OperationError
 
 logger = logging.getLogger(__name__)
 
 
 class AnalyticsService:
-    """سرویس تحلیلی برای کار با داده‌های ClickHouse"""
+    """
+    سرویس تحلیل داده‌ها در ClickHouse با پشتیبانی از کش و بهینه‌سازی کوئری‌ها
 
-    def __init__(self, config: ClickHouseConfig, redis_config: RedisConfig):
-        """راه‌اندازی سرویس با تنظیمات"""
-        self.config = config
-        self._adapter = ClickHouseAdapter(config)
-        self._cache = AnalyticsCache(redis_config)
-        self._initialized_tables = set()
+    این سرویس مسئول اجرای کوئری‌های تحلیلی در ClickHouse است و برای بهبود عملکرد،
+    از کش و بهینه‌سازی کوئری استفاده می‌کند.
+    """
 
-    async def connect(self) -> None:
-        """برقراری اتصال به سرویس‌ها"""
-        await self._adapter.connect()
-        await self._cache.initialize()
-
-    async def initialize(self) -> None:
-        """راه‌اندازی اولیه سرویس و ایجاد جداول پایه"""
-        await self.connect()
-        await self._ensure_base_tables()
-        logger.info("Analytics service initialized successfully")
-
-    async def _ensure_base_tables(self) -> None:
-        """ایجاد جداول پایه مورد نیاز"""
-        events_schema = TableSchema(
-            name='events',
-            columns={
-                'event_id': 'String',
-                'event_type': 'LowCardinality(String)',
-                'timestamp': 'DateTime',
-                'data': 'String',  # JSON
-                'metadata': 'String'  # JSON
-            },
-            engine='MergeTree()',
-            partition_by='toYYYYMM(timestamp)',
-            order_by=['timestamp', 'event_type', 'event_id']
-        )
-
-        if 'events' not in self._initialized_tables:
-            await self._adapter.create_table('events', events_schema.columns)
-            self._initialized_tables.add('events')
-            logger.info("Created events table")
-
-    async def store_event(self, event: AnalyticsEvent) -> None:
-        """ذخیره یک رویداد تحلیلی"""
-        query = """
-            INSERT INTO events (event_id, event_type, timestamp, data, metadata)
-            VALUES ($1, $2, $3, $4, $5)
+    def __init__(self, clickhouse_adapter: ClickHouseAdapter,
+                 query_optimizer: Optional[QueryOptimizer] = None,
+                 analytics_cache: Optional[AnalyticsCache] = None):
         """
-        params = [
-            event.event_id,
-            event.event_type,
-            event.timestamp,
-            str(event.data),
-            str(event.metadata) if event.metadata else None
-        ]
-        await self._adapter.execute(query, params)
-        logger.debug(f"Stored event: {event.event_id}")
+        مقداردهی اولیه سرویس تحلیل داده‌ها
+
+        Args:
+            clickhouse_adapter (ClickHouseAdapter): آداپتور اتصال به ClickHouse
+            query_optimizer (QueryOptimizer, optional): بهینه‌ساز کوئری
+            analytics_cache (AnalyticsCache, optional): کش تحلیلی پیشرفته
+        """
+        # آداپتور ClickHouse اجباری است
+        self.clickhouse_adapter = clickhouse_adapter
+
+        # استفاده از query_optimizer ارائه شده یا ایجاد نمونه جدید
+        self.query_optimizer = query_optimizer or QueryOptimizer(self.clickhouse_adapter)
+
+        # تنظیم سیستم کش
+        self.analytics_cache = analytics_cache
+
+        # لاگ مناسب برای تنظیمات کش
+        if self.analytics_cache:
+            logger.info("Analytics Service initialized with AnalyticsCache")
+        else:
+            logger.info("Analytics Service initialized without caching")
 
     async def execute_analytics_query(self, query: AnalyticsQuery) -> AnalyticsResult:
         """
-        اجرای یک پرس‌وجوی تحلیلی با پشتیبانی از کش و مدیریت خطا
+        اجرای یک پرس‌وجوی تحلیلی با بررسی کش و بهینه‌سازی
+
+        این متد ابتدا کش را بررسی می‌کند، سپس کوئری را بهینه‌سازی کرده و
+        در نهایت آن را در ClickHouse اجرا می‌کند.
 
         Args:
-            query: پرس‌وجوی تحلیلی
+            query (AnalyticsQuery): کوئری تحلیلی با متن و پارامترها
 
         Returns:
-            نتیجه تحلیل
+            AnalyticsResult: نتیجه کوئری با داده‌ها یا خطا
 
         Raises:
-            ConnectionError: در صورت بروز مشکل در اتصال به دیتابیس
-            OperationError: در صورت بروز خطا در اجرای پرس‌وجو
+            QueryError: در صورت بروز خطا در اجرای کوئری
         """
-        # بررسی کش
+        # بررسی کش برای نتیجه از قبل ذخیره‌شده
+        cached_result = None
+
         try:
-            cached_result = await self._cache.get_cached_result(query)
+            # تلاش برای بازیابی از کش
+            if self.analytics_cache:
+                cached_result = await self.analytics_cache.get_cached_result(
+                    query.query_text, query.params)
+
             if cached_result:
-                logger.debug("Query result found in cache")
-                return cached_result
+                logger.info(f"Returning cached result for query ID: {id(query)}")
+                return AnalyticsResult(query=query, data=cached_result)
+
         except Exception as e:
-            logger.warning(f"Cache lookup failed: {str(e)}")
-            # در صورت خطا در کش، ادامه می‌دهیم تا از دیتابیس بخوانیم
+            # خطای کش را لاگ می‌کنیم ولی ادامه می‌دهیم
+            logger.warning(f"Cache retrieval error, proceeding without cache: {str(e)}")
 
-        # اجرای پرس‌وجو
         try:
-            start_time = datetime.now()
-            result = await self._adapter.execute_analytics_query(query)
-            execution_time = (datetime.now() - start_time).total_seconds()
+            # بهینه‌سازی کوئری قبل از اجرا
+            if hasattr(self.query_optimizer, 'optimize_query_with_column_expansion'):
+                optimized_query = await self.query_optimizer.optimize_query_with_column_expansion(query.query_text)
+            else:
+                optimized_query = self.query_optimizer.optimize_query(query.query_text)
 
-        except ConnectionError:
-            # خطای اتصال را مستقیماً منتقل می‌کنیم
-            logger.error("Database connection failed", exc_info=True)
+            # اجرای کوئری در ClickHouse با پارامترها
+            result = await self.clickhouse_adapter.execute(optimized_query, query.params)
+
+            # ذخیره نتیجه در کش
+            try:
+                if self.analytics_cache:
+                    await self.analytics_cache.set_cached_result(
+                        query.query_text, result, params=query.params)
+            except Exception as cache_error:
+                # خطای کش را لاگ می‌کنیم ولی نتیجه را برمی‌گردانیم
+                logger.warning(f"Failed to cache result: {str(cache_error)}")
+
+            return AnalyticsResult(query=query, data=result)
+
+        except QueryError:
+            # خطای کوئری را مستقیماً منتقل می‌کنیم
             raise
 
         except Exception as e:
-            # سایر خطاها را به OperationError تبدیل می‌کنیم
-            error_msg = f"Query execution failed: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            raise OperationError(error_msg) from e
-
-        # ایجاد نتیجه
-        analytics_result = AnalyticsResult(
-            query=query,
-            data=result,
-            total_count=len(result),
-            execution_time=execution_time
-        )
-
-        # ذخیره در کش (خطاهای کش را نادیده می‌گیریم)
-        try:
-            await self._cache.cache_result(analytics_result)
-        except Exception as e:
-            logger.warning(f"Failed to cache result: {str(e)}")
-
-        return analytics_result
-
-    async def get_event_trends(self,
-                               event_type: str,
-                               interval: str = '1 hour',
-                               days: int = 7,
-                               use_cache: bool = True) -> AnalyticsResult:
-        """دریافت روند رویدادها در طول زمان"""
-        end_time = datetime.now()
-        start_time = end_time - timedelta(days=days)
-
-        query = AnalyticsQuery(
-            dimensions=[f"toStartOf{interval}(timestamp) as period"],
-            metrics=['count() as count'],
-            filters={'event_type': event_type},
-            time_range=(start_time, end_time),
-            order_by=['period']
-        )
-
-        if not use_cache:
-            result = await self._adapter.execute_analytics_query(query)
-            return AnalyticsResult(
-                query=query,
-                data=result,
-                total_count=len(result),
-                execution_time=0
+            error_msg = f"Analytics query execution failed: {str(e)}"
+            logger.error(error_msg)
+            raise QueryError(
+                message=error_msg,
+                code="CHE610",
+                query=query.query_text[:100],
+                details={"params": query.params if query.params else {}}
             )
 
-        return await self.execute_analytics_query(query)
+    async def execute_batch_queries(self, queries: List[AnalyticsQuery]) -> List[AnalyticsResult]:
+        """
+        اجرای دسته‌ای چندین کوئری تحلیلی
 
-    async def invalidate_event_cache(self, event_type: Optional[str] = None) -> None:
-        """حذف کش برای یک نوع رویداد خاص یا تمام رویدادها"""
-        if event_type:
-            pattern = f"query:*{event_type}*"
-        else:
-            pattern = None
-        await self._cache.invalidate_cache(pattern)
+        این متد چندین کوئری را یکی پس از دیگری اجرا می‌کند و نتایج را
+        در یک لیست برمی‌گرداند. حتی اگر یک کوئری شکست بخورد، بقیه کوئری‌ها اجرا می‌شوند.
+
+        Args:
+            queries (List[AnalyticsQuery]): لیست کوئری‌های تحلیلی
+
+        Returns:
+            List[AnalyticsResult]: لیست نتایج کوئری‌ها
+        """
+        results = []
+
+        for query in queries:
+            try:
+                result = await self.execute_analytics_query(query)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Error executing query in batch: {str(e)}")
+                # ادامه اجرای بقیه کوئری‌ها با وجود خطا
+                results.append(AnalyticsResult(
+                    query=query,
+                    data=[],
+                    error=str(e)
+                ))
+
+        return results
+
+    async def invalidate_cache(self, query: Optional[AnalyticsQuery] = None) -> None:
+        """
+        حذف کش برای یک کوئری خاص یا کل کش
+
+        Args:
+            query (AnalyticsQuery, optional): کوئری برای حذف از کش. اگر None باشد، کل کش پاک می‌شود.
+
+        Raises:
+            OperationalError: در صورت بروز خطا در حذف کش
+        """
+        if not self.analytics_cache:
+            logger.info("No cache system available to invalidate")
+            return
+
+        try:
+            if query:
+                # حذف کش برای یک کوئری خاص
+                await self.analytics_cache.invalidate_cache(query.query_text, query.params)
+                logger.info(f"Cache invalidated for query ID: {id(query)}")
+            else:
+                # حذف کل کش
+                await self.analytics_cache.invalidate_cache()
+                logger.info("All cache entries invalidated")
+
+        except Exception as e:
+            error_msg = f"Failed to invalidate cache: {str(e)}"
+            logger.error(error_msg)
+            raise OperationalError(message=error_msg, code="CHE611")
 
     async def get_cache_stats(self) -> Dict[str, Any]:
-        """دریافت آمار کش"""
-        return await self._cache.get_cache_stats()
+        """
+        دریافت آمار کش
 
-    async def shutdown(self) -> None:
-        """خاتمه سرویس"""
-        await self._adapter.disconnect()
-        await self._cache.shutdown()
-        logger.info("Analytics service shut down successfully")
+        Returns:
+            Dict[str, Any]: آمار کش
+
+        Raises:
+            OperationalError: در صورت بروز خطا در دریافت آمار
+        """
+        try:
+            if self.analytics_cache:
+                return await self.analytics_cache.get_stats()
+            else:
+                return {
+                    "cache_available": False,
+                    "message": "No cache system available"
+                }
+        except Exception as e:
+            error_msg = f"Failed to get cache stats: {str(e)}"
+            logger.error(error_msg)
+            raise OperationalError(message=error_msg, code="CHE612")

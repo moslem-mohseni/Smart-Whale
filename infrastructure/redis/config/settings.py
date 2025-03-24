@@ -1,52 +1,41 @@
-# infrastructure/redis/config/settings.py
-
+import os
 from dataclasses import dataclass
 from typing import Optional, List, Dict
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 @dataclass
 class RedisConfig:
     """
     تنظیمات اتصال به Redis
-
-    این کلاس تمام پارامترهای مورد نیاز برای اتصال و پیکربندی Redis را نگهداری می‌کند.
-    پشتیبانی از حالت‌های مختلف اتصال (تکی، کلاستر، sentinel) را فراهم می‌کند.
     """
-    # تنظیمات پایه
-    host: str
-    port: int
-    database: int = 0
-    password: Optional[str] = None
+    host: str = os.getenv('REDIS_HOST', 'localhost')
+    port: int = int(os.getenv('REDIS_PORT', 6379))
+    database: int = int(os.getenv('REDIS_DB', 0))
+    password: Optional[str] = os.getenv('REDIS_PASSWORD', None)
 
-    # تنظیمات اتصال
-    max_connections: int = 10
-    socket_timeout: int = 5
-    socket_connect_timeout: int = 5
-    retry_on_timeout: bool = True
+    max_connections: int = int(os.getenv('REDIS_MAX_CONNECTIONS', 10))
+    socket_timeout: int = int(os.getenv('REDIS_SOCKET_TIMEOUT', 5))
+    socket_connect_timeout: int = int(os.getenv('REDIS_CONNECT_TIMEOUT', 5))
+    retry_on_timeout: bool = os.getenv('REDIS_RETRY_ON_TIMEOUT', 'True').lower() == 'true'
 
-    # تنظیمات SSL/TLS
-    ssl: bool = False
-    ssl_cert_reqs: Optional[str] = None
-    ssl_certfile: Optional[str] = None
-    ssl_keyfile: Optional[str] = None
-    ssl_ca_certs: Optional[str] = None
+    ssl: bool = os.getenv('REDIS_SSL', 'False').lower() == 'true'
+    ssl_cert_reqs: Optional[str] = os.getenv('REDIS_SSL_CERT_REQS')
+    ssl_certfile: Optional[str] = os.getenv('REDIS_SSL_CERTFILE')
+    ssl_keyfile: Optional[str] = os.getenv('REDIS_SSL_KEYFILE')
+    ssl_ca_certs: Optional[str] = os.getenv('REDIS_SSL_CA_CERTS')
 
-    # تنظیمات کلاستر
-    cluster_mode: bool = False
+    cluster_mode: bool = os.getenv('REDIS_CLUSTER_MODE', 'False').lower() == 'true'
     cluster_nodes: Optional[List[Dict[str, str]]] = None
 
-    # تنظیمات Sentinel
-    sentinel_mode: bool = False
-    sentinel_master: Optional[str] = None
+    sentinel_mode: bool = os.getenv('REDIS_SENTINEL_MODE', 'False').lower() == 'true'
+    sentinel_master: Optional[str] = os.getenv('REDIS_SENTINEL_MASTER')
     sentinel_nodes: Optional[List[Dict[str, str]]] = None
 
     def get_connection_params(self) -> dict:
-        """
-        تولید پارامترهای اتصال برای aioredis
-
-        Returns:
-            دیکشنری حاوی پارامترهای اتصال
-        """
+        """تولید پارامترهای اتصال برای aioredis"""
         params = {
             'host': self.host,
             'port': self.port,
@@ -57,7 +46,6 @@ class RedisConfig:
             'retry_on_timeout': self.retry_on_timeout
         }
 
-        # اضافه کردن تنظیمات SSL
         if self.ssl:
             params.update({
                 'ssl': True,
@@ -70,17 +58,35 @@ class RedisConfig:
         return params
 
     def get_cluster_params(self) -> dict:
-        """
-        تولید پارامترهای اتصال برای حالت کلاستر
-
-        Returns:
-            دیکشنری حاوی پارامترهای کلاستر
-        """
+        """تولید پارامترهای اتصال برای حالت کلاستر"""
         if not self.cluster_mode:
-            raise ValueError("Cluster mode is not enabled")
+            raise ValueError("حالت کلاستر فعال نیست")
 
         return {
             'startup_nodes': self.cluster_nodes,
             'password': self.password,
             'ssl': self.ssl
         }
+
+    def get_sentinel_params(self) -> dict:
+        """تولید پارامترهای اتصال برای حالت Sentinel"""
+        if not self.sentinel_mode:
+            raise ValueError("حالت Sentinel فعال نیست")
+
+        return {
+            'master_name': self.sentinel_master,
+            'sentinels': self.sentinel_nodes,
+            'password': self.password,
+            'db': self.database,
+            'ssl': self.ssl
+        }
+
+    @classmethod
+    def from_env(cls) -> 'RedisConfig':
+        """ایجاد نمونه از کانفیگ با استفاده از متغیرهای محیطی"""
+        return cls()
+
+
+# نصب بسته مورد نیاز:
+# pip install python-dotenv
+

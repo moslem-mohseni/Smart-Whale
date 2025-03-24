@@ -1,6 +1,4 @@
-
-# infrastructure/timescaledb/domain/__init__.py
-from .models import TimeSeriesData
+from .models import TimeSeriesData, TableSchema
 from .value_objects import TimeRange
 
-__all__ = ['TimeSeriesData', 'TimeRange']
+__all__ = ["TimeSeriesData", "TableSchema", "TimeRange"]

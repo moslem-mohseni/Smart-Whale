@@ -1,17 +1,11 @@
-# infrastructure/redis/domain/models.py
-
 from dataclasses import dataclass
 from typing import Any, Optional, Dict
 from datetime import datetime, timedelta
 
-
 @dataclass
 class CacheItem:
     """
-    مدل پایه برای آیتم‌های ذخیره شده در کش
-
-    این کلاس ساختار پایه یک آیتم کش را تعریف می‌کند که شامل
-    کلید، مقدار، زمان انقضا و متادیتای اضافی است.
+    مدل داده‌ای برای آیتم‌های کش شده در Redis
     """
     key: str
     value: Any
@@ -25,20 +19,16 @@ class CacheItem:
 
     @property
     def is_expired(self) -> bool:
-        """بررسی منقضی شدن آیتم"""
+        """بررسی وضعیت انقضای آیتم کش"""
         if self.ttl is None:
             return False
         expiry_time = self.created_at + timedelta(seconds=self.ttl)
         return datetime.now() > expiry_time
 
-
 @dataclass
 class CacheNamespace:
     """
-    فضای نام برای گروه‌بندی کلیدهای مرتبط
-
-    این کلاس برای سازماندهی و مدیریت بهتر کلیدها استفاده می‌شود و
-    امکان اعمال سیاست‌های مشترک روی گروهی از کلیدها را فراهم می‌کند.
+    فضای نام برای گروه‌بندی کلیدهای مرتبط در Redis
     """
     name: str
     default_ttl: Optional[int] = None

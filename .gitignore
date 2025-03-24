@@ -1,9 +1,11 @@
-# Python
+# فایل‌های پایتون و کامپایل شده
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+
+# فایل‌های توزیع و ساخت پروژه
 build/
 develop-eggs/
 dist/
@@ -20,46 +22,32 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual Environment
+# محیط‌های مجازی و پوشه‌های مربوطه
+.venv/
 venv/
-env/
 ENV/
+Lib/
+Include/
+*.cfg
+bin/
+share/
 
-# IDEs
+
+# محیط‌های توسعه یکپارچه و فایل‌های موقت
 .idea/
 .vscode/
 *.swp
 *.swo
+*.sublime-workspace
+*.sublime-project
+.project
+.pydevproject
+*~
 
-# Logs
+# فایل‌های لاگ و موقت
 *.log
 logs/
 log/
+tmp/
+temp/
 
-# Local development settings
-.env
-.env.local
-
-# Database
-*.db
-*.sqlite3
-
-# Docker
-.docker/
-
-# Testing
-.coverage
-htmlcov/
-.pytest_cache/
-.mypy_cache/
-
-# AI models and data
-ai/models/**/weights/
-ai/data/raw/*
-ai/data/processed/*
-!ai/data/raw/.gitkeep
-!ai/data/processed/.gitkeep
-
-# System Files
-.DS_Store
-Thumbs.db
